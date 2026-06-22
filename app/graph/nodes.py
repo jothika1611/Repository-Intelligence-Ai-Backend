@@ -5,6 +5,10 @@ from app.graph.state import GraphState
 from app.retrieval.hybrid_search import hybrid_retriever
 from app.llm.provider import get_llm_provider
 from app.llm.prompts import PromptBuilder
+from app.llm.tools import get_github_tools
+from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import HumanMessage
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +55,13 @@ async def retrieval_node(state: GraphState) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Retrieval node failed: {e}", exc_info=True)
         
-    return {"retrieved_chunks": all_results}
+    # Calculate retrieval confidence (average cross_encoder_score)
+    confidence = 0.0
+    if all_results:
+        scores = [hit.get("cross_encoder_score", 0.0) for hit in all_results]
+        confidence = sum(scores) / len(scores)
+        
+    return {"retrieved_chunks": all_results, "retrieval_confidence": confidence}
 
 async def context_builder_node(state: GraphState) -> Dict[str, Any]:
     """
@@ -87,6 +97,41 @@ async def generation_node(state: GraphState) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Generation node failed: {e}", exc_info=True)
         return {"answer": "An error occurred while generating the answer."}
+
+async def tool_agent_node(state: GraphState) -> Dict[str, Any]:
+    """
+    Fallback agent node that uses LangGraph's create_react_agent to actively browse the repository.
+    """
+    logger.info("Retrieval confidence low. Routing to tool agent...")
+    llm_provider = get_llm_provider()
+    raw_llm = llm_provider.llm  # Assuming the provider exposes the underlying BaseChatModel as .llm
+    
+    tools = get_github_tools(state["repository_id"])
+    
+    # We create an ephemeral react agent just for this query
+    agent = create_react_agent(raw_llm, tools)
+    
+    system_prompt = (
+        f"You are a helpful assistant analyzing the repository {state['repository_id']}. "
+        "Please use your tools to find the answer to the user's question. "
+        "IMPORTANT: If you try to read a file and it is not found, the user might have made a spelling mistake (e.g., 'read me' instead of 'README.md'). "
+        "In such cases, use the get_repository_tree() tool to look for similar filenames before giving up. "
+        "If you still cannot find it, ask the user to clarify which file they meant."
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": state["question"]}
+    ]
+    
+    try:
+        # Prevent infinite loops by setting a recursion limit
+        config = {"recursion_limit": 10}
+        result = await agent.ainvoke({"messages": messages}, config)
+        answer = result["messages"][-1].content
+        return {"answer": answer}
+    except Exception as e:
+        logger.error(f"Tool agent failed: {e}", exc_info=True)
+        return {"answer": "I encountered an internal error while searching the repository. If you are asking about a specific file (like the README), please make sure the spelling is correct and try again!"}
 
 async def citation_node(state: GraphState) -> Dict[str, Any]:
     """

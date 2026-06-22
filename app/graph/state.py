@@ -11,6 +11,7 @@ class GraphState(TypedDict):
     search_queries: List[str]
     retrieved_chunks: List[Dict[str, Any]]
     context_chunks: List[str]
+    retrieval_confidence: float
     
     # Final output
     answer: str

@@ -4,11 +4,14 @@ import re
 from typing import Optional, List, Dict, Any, Type
 
 import httpx
+from cachetools import TTLCache
 
 from app.schemas.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Module-level cache to persist across client instantiations
+_github_cache = TTLCache(maxsize=100, ttl=900)
 
 class GitHubClientError(Exception):
     """Base exception for GitHub client errors."""
@@ -62,7 +65,9 @@ class GitHubClient:
             base_url=self.BASE_URL,
             headers=headers,
             timeout=httpx.Timeout(timeout_seconds),
+            follow_redirects=True
         )
+        self.cache = _github_cache
 
     def _validate_owner_repo(self, owner: str, repo: str) -> None:
         """
@@ -236,6 +241,69 @@ class GitHubClient:
             })
                 
         return documents
+
+    async def get_contents(self, owner: str, repo: str, path: str) -> Dict[str, Any]:
+        """
+        Fetch file or directory contents from the GitHub Contents API.
+        Results are cached to minimize API usage.
+        """
+        self._validate_owner_repo(owner, repo)
+        cache_key = f"{owner}/{repo}:{path}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        api_path = f"/repos/{owner}/{repo}/contents/{path}"
+        try:
+            response = await self._make_request("GET", api_path)
+            data = response.json()
+            
+            # If it's a file and base64 encoded, decode it for the LLM
+            if isinstance(data, dict) and data.get("type") == "file" and data.get("encoding") == "base64":
+                content_base64 = data.get("content", "")
+                if content_base64:
+                    try:
+                        decoded_bytes = base64.b64decode(content_base64)
+                        data["decoded_content"] = decoded_bytes.decode("utf-8", errors="replace")
+                    except Exception as e:
+                        logger.warning(f"Failed to decode base64 content for {path}: {e}")
+                        
+            self.cache[cache_key] = data
+            return data
+            
+        except ResourceNotFoundError:
+            logger.info(f"Path not found: {path} in {owner}/{repo}")
+            return {"error": f"Path not found: {path}"}
+
+    async def get_repository_tree_cache(self, owner: str, repo: str) -> Dict[str, Any]:
+        """
+        Fetch the entire repository tree structure recursively.
+        Cached heavily to serve as the primary tool for repository-wide questions.
+        """
+        self._validate_owner_repo(owner, repo)
+        cache_key = f"{owner}/{repo}:tree"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+            
+        default_branch = await self.get_default_branch(owner, repo)
+        tree_path = f"/repos/{owner}/{repo}/git/trees/{default_branch}"
+        
+        try:
+            response = await self._make_request("GET", tree_path, params={"recursive": "1"})
+            data = response.json()
+            
+            # Simplify the tree structure for the LLM context to save tokens
+            simplified_tree = []
+            for item in data.get("tree", []):
+                simplified_tree.append({
+                    "path": item.get("path"),
+                    "type": item.get("type")
+                })
+                
+            result = {"tree": simplified_tree, "truncated": data.get("truncated", False)}
+            self.cache[cache_key] = result
+            return result
+        except ResourceNotFoundError:
+            return {"error": f"Repository tree not found for {owner}/{repo}"}
 
     async def get_issues(self, owner: str, repo: str, limit: int = 100) -> List[Dict[str, Any]]:
         """
